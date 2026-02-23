@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 const ALLOWED_ORIGINS = [
-  'https://civilsentine2.netlify.app',
+  'https://civicsentinel2.netlify.app',
   'http://localhost:3000',
   'http://localhost:5173',
   'http://127.0.0.1:3000',
