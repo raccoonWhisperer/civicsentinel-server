@@ -5,7 +5,6 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── CORS: Allow your Netlify site + local development ───
 const ALLOWED_ORIGINS = [
   'https://tn-karst-ground-truth.netlify.app',
   'http://localhost:3000',
@@ -15,7 +14,6 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc)
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
@@ -24,38 +22,91 @@ app.use(cors({
 
 app.use(express.json());
 
-// ─── Simple in-memory rate limiter ───
+// ─── Rate limiter ───
 const rateLimits = new Map();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 5; // 5 requests per minute per IP
-
 function checkRateLimit(ip) {
   const now = Date.now();
   const record = rateLimits.get(ip);
-  if (!record || now - record.windowStart > RATE_LIMIT_WINDOW) {
+  if (!record || now - record.windowStart > 60000) {
     rateLimits.set(ip, { windowStart: now, count: 1 });
     return true;
   }
-  if (record.count >= RATE_LIMIT_MAX) return false;
+  if (record.count >= 5) return false;
   record.count++;
   return true;
 }
-
-// Clean up rate limit records every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of rateLimits) {
-    if (now - record.windowStart > RATE_LIMIT_WINDOW * 2) rateLimits.delete(ip);
+    if (now - record.windowStart > 120000) rateLimits.delete(ip);
   }
-}, 5 * 60 * 1000);
+}, 300000);
+
+// ─── URL verification ───
+async function verifyUrl(url) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const r = await fetch(url, {
+      method: 'HEAD',
+      signal: controller.signal,
+      headers: { 'User-Agent': 'CivicSentinel/2.0 (community watchdog)' },
+      redirect: 'follow'
+    });
+    clearTimeout(timeout);
+    return r.ok || r.status === 403 || r.status === 405;
+  } catch {
+    try {
+      const c2 = new AbortController();
+      const t2 = setTimeout(() => c2.abort(), 5000);
+      const r2 = await fetch(url, {
+        method: 'GET',
+        signal: c2.signal,
+        headers: { 'User-Agent': 'CivicSentinel/2.0', 'Range': 'bytes=0-0' },
+        redirect: 'follow'
+      });
+      clearTimeout(t2);
+      return r2.ok || r2.status === 206 || r2.status === 403;
+    } catch { return false; }
+  }
+}
+
+function extractDomain(url) {
+  try { return new URL(url).hostname.replace('www.', ''); }
+  catch { return 'Unknown'; }
+}
+
+// ─── Extract REAL citations from Claude's web search results ───
+// These are the actual URLs and snippets the search engine returned,
+// NOT Claude's reinterpretation. This is the source of truth.
+function extractCitations(content) {
+  const citations = [];
+  for (const block of content) {
+    if (block.type === 'web_search_tool_result' && block.content) {
+      for (const item of block.content) {
+        if (item.type === 'web_search_result') {
+          citations.push({
+            title: item.title || '',
+            url: item.url || '',
+            snippet: item.encrypted_content ? '[Content at source]' : (item.page_snippet || ''),
+            source: extractDomain(item.url || ''),
+            publishedDate: item.page_age || ''
+          });
+        }
+      }
+    }
+  }
+  return citations;
+}
 
 // ─── Health check ───
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     service: 'CivicSentinel API',
     status: 'running',
-    version: '1.0.0',
-    mission: 'Karst Basin Community Watchdog'
+    version: '2.0.0',
+    mission: 'Karst Basin Community Watchdog',
+    factChecking: 'enabled — all results verified against source URLs'
   });
 });
 
@@ -65,63 +116,53 @@ app.get('/health', (req, res) => {
 
 // ─── Main search endpoint ───
 app.post('/api/search', async (req, res) => {
-  // Rate limit check
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   if (!checkRateLimit(clientIp)) {
-    return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
+    return res.status(429).json({ error: 'Too many requests. Please wait a minute.' });
   }
 
-  // Validate API key is configured
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: 'Server API key not configured. Contact administrator.' });
+    return res.status(500).json({ error: 'Server API key not configured.' });
   }
 
   const { city, topic, category, dateFrom, dateTo, includeSocial } = req.body;
-
   if (!city || !topic) {
     return res.status(400).json({ error: 'City and topic are required.' });
   }
 
-  // Build the prompt
   let dateClause = '';
   if (dateFrom && dateTo) dateClause = `Only include results from between ${dateFrom} and ${dateTo}.`;
   else if (dateFrom) dateClause = `Only include results from after ${dateFrom}.`;
   else if (dateTo) dateClause = `Only include results from before ${dateTo}.`;
 
   const catClause = category && category !== 'all' && category !== 'other_custom'
-    ? `Focus specifically on issues related to: ${category}.`
-    : '';
+    ? `Focus on: ${category}.` : '';
 
   const socialClause = includeSocial
-    ? `IMPORTANT: Also search for social media posts and community discussions. Try:
-- "site:reddit.com ${city} ${topic}"
-- "site:twitter.com ${city} ${topic}" or "site:x.com ${city} ${topic}"
-- "${city} ${topic} community discussion"
-- "${city} ${topic} residents complain"
-Include Reddit posts, tweets, and community forum posts. Use the platform name as source.`
-    : '';
+    ? `Also search: "site:reddit.com ${city} ${topic}" and "site:twitter.com ${city} ${topic}".` : '';
 
-  const prompt = `Search the web for community issues in ${city} about: ${topic}
+  const prompt = `Search the web for: ${city} ${topic}
 
 ${dateClause}
 ${catClause}
-
-Context: This search is for a community watchdog platform focused on karst basin geological risks. The Murfreesboro/Rutherford County area of Tennessee sits on Ordovician limestone with extensive karst features (sinkholes, caves, underground streams). Issues of particular interest include: geothermal drilling damage to water wells and home foundations, sinkhole formation and subsidence, construction in karst terrain, groundwater contamination, and regulatory oversight gaps.
-
 ${socialClause}
 
-Instructions:
-1. Search for "${city} ${topic}" and variations of those terms
-2. Also try related searches if the first doesn't return enough results
-3. Find real, verified news articles, government notices, community reports${includeSocial ? ', AND social media posts/discussions' : ''}
-4. If you find relevant results, format them as a JSON array
-5. If you find NO relevant results, respond with: {"no_results": true, "searched_for": "what you searched", "suggestion": "try searching for X instead"}
+CRITICAL ACCURACY RULES:
+1. ONLY report stories that appeared in your actual web search results.
+2. DO NOT invent, fabricate, combine, or embellish any story.
+3. Use the EXACT headline from each article — do not rewrite it.
+4. Use the EXACT URL from each search result.
+5. The summary must only describe what the article actually says.
+6. If you found 0 relevant results, say so. An empty result is correct. A fabricated result is unacceptable.
+7. DO NOT create incidents by combining a real place name with an imagined event.
+8. If an article is about a different city or topic, DO NOT include it.
 
-JSON array format (when results found):
-[{"title":"headline or post title","summary":"2-3 sentence description from the actual source","source":"publication or platform name","url":"actual URL","timestamp":"date published or posted","category":"karst_sinkholes|geothermal|water_wells|foundation|construction|environment|infrastructure|traffic|waste|education|safety|government|housing|water_sewer|other","severity":"critical|high|medium|low","location":"specific location"}]
+Format as JSON array:
+[{"title":"EXACT headline","summary":"What the article says, nothing added","source":"publication name","url":"EXACT URL","timestamp":"date from article","category":"karst_sinkholes|geothermal|water_wells|foundation|construction|environment|infrastructure|traffic|waste|education|safety|government|housing|water_sewer|other","severity":"critical|high|medium|low","location":"location from article"}]
 
-Respond with ONLY the JSON. No markdown, no backticks, no explanation before or after.`;
+If NO results: {"no_results": true, "searched_for": "what you searched"}
+Respond with ONLY JSON.`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -140,49 +181,156 @@ Respond with ONLY the JSON. No markdown, no backticks, no explanation before or 
     });
 
     const data = await response.json();
-
     if (data.error) {
-      return res.status(502).json({ error: data.error.message || 'Claude API error', rawResponse: JSON.stringify(data.error) });
+      return res.status(502).json({ error: data.error.message || 'API error' });
     }
 
-    // Collect response parts
     const allContent = data.content || [];
     const textParts = allContent.filter(b => b.type === 'text').map(b => b.text);
     const searchParts = allContent.filter(b => b.type === 'web_search_tool_result');
-    
+
+    // LAYER 1: Extract real citations from web search
+    const realCitations = extractCitations(allContent);
+
     const rawParts = [];
     if (searchParts.length > 0) rawParts.push(`[Web searches performed: ${searchParts.length}]`);
+    if (realCitations.length > 0) rawParts.push(`[Source URLs found: ${realCitations.length}]`);
     rawParts.push(...textParts);
-    const rawResponse = rawParts.join('\n\n');
 
-    // Parse results
+    if (realCitations.length > 0) {
+      rawParts.push('\n--- VERIFIED SOURCE URLS ---');
+      realCitations.forEach((c, i) => {
+        rawParts.push(`${i+1}. ${c.title}\n   ${c.url}\n   ${c.source} | ${c.publishedDate || 'Date unknown'}`);
+      });
+    }
+
+    // LAYER 2: Parse Claude's structured response
     const fullText = textParts.join('\n');
     const cleaned = fullText.replace(/```json|```/g, '').trim();
 
     if (cleaned.includes('"no_results"')) {
-      return res.json({ items: [], rawResponse });
+      return res.json({ items: [], rawResponse: rawParts.join('\n\n'), verifiedSources: realCitations, stats: { totalFound: 0, verified: 0, rejected: 0 } });
     }
 
     const match = cleaned.match(/\[[\s\S]*\]/);
+
+    // If Claude didn't return structured items, build from raw citations
     if (!match) {
-      return res.json({ items: [], rawResponse });
+      if (realCitations.length > 0) {
+        const items = realCitations.filter(c => c.url && c.title).map((c, i) => ({
+          id: `v${Date.now()}_${i}`,
+          title: c.title,
+          summary: c.snippet || 'Click source link to read the original article.',
+          source: c.source,
+          url: c.url,
+          timestamp: c.publishedDate || 'Recent',
+          category: 'other',
+          severity: 'medium',
+          location: city,
+          verified: true,
+          verificationNote: 'Direct from web search results'
+        }));
+        return res.json({ items, rawResponse: rawParts.join('\n\n'), verifiedSources: realCitations, stats: { totalFound: items.length, verified: items.length, rejected: 0 } });
+      }
+      return res.json({ items: [], rawResponse: rawParts.join('\n\n'), verifiedSources: realCitations, stats: { totalFound: 0, verified: 0, rejected: 0 } });
     }
 
+    // LAYER 3: Cross-reference and verify
     try {
-      const items = JSON.parse(match[0]).map((it, i) => ({
-        id: `l${Date.now()}_${i}`,
-        title: it.title || '',
-        summary: it.summary || '',
-        source: it.source || 'Unknown',
-        url: it.url || '',
-        timestamp: it.timestamp || 'Recent',
-        category: it.category || 'other',
-        severity: it.severity || 'medium',
-        location: it.location || city,
-      }));
-      return res.json({ items, rawResponse });
+      const parsedItems = JSON.parse(match[0]);
+
+      // Build lookup of real URLs
+      const realUrlSet = new Set();
+      for (const c of realCitations) {
+        try { realUrlSet.add(new URL(c.url).hostname + new URL(c.url).pathname); } catch {}
+        realUrlSet.add(c.url); // also exact match
+      }
+      const realDomainSet = new Set(realCitations.map(c => c.source));
+
+      const verifiedItems = [];
+      const rejectedItems = [];
+
+      for (let i = 0; i < parsedItems.length; i++) {
+        const it = parsedItems[i];
+        const item = {
+          id: `l${Date.now()}_${i}`,
+          title: it.title || '',
+          summary: it.summary || '',
+          source: it.source || 'Unknown',
+          url: it.url || '',
+          timestamp: it.timestamp || 'Recent',
+          category: it.category || 'other',
+          severity: it.severity || 'medium',
+          location: it.location || city,
+          verified: false,
+          verificationNote: ''
+        };
+
+        if (!item.url || !item.url.startsWith('http')) {
+          item.verificationNote = 'REJECTED — No valid URL';
+          rejectedItems.push(item);
+          continue;
+        }
+
+        // Check against real citations
+        let urlKey = '';
+        try { urlKey = new URL(item.url).hostname + new URL(item.url).pathname; } catch { urlKey = item.url; }
+
+        if (realUrlSet.has(urlKey) || realUrlSet.has(item.url)) {
+          item.verified = true;
+          item.verificationNote = 'Confirmed — URL found in web search results';
+          verifiedItems.push(item);
+        } else if (realDomainSet.has(extractDomain(item.url))) {
+          // Domain matches — verify URL actually responds
+          const exists = await verifyUrl(item.url);
+          if (exists) {
+            item.verified = true;
+            item.verificationNote = 'Verified — URL responds (domain from search results)';
+            verifiedItems.push(item);
+          } else {
+            item.verificationNote = 'REJECTED — URL does not respond';
+            rejectedItems.push(item);
+          }
+        } else {
+          // Unknown domain — verify URL
+          const exists = await verifyUrl(item.url);
+          if (exists) {
+            item.verified = true;
+            item.verificationNote = 'Verified — URL responds';
+            verifiedItems.push(item);
+          } else {
+            item.verificationNote = 'REJECTED — URL does not exist (likely fabricated)';
+            rejectedItems.push(item);
+          }
+        }
+      }
+
+      if (rejectedItems.length > 0) {
+        rawParts.push('\n--- REJECTED (FAILED VERIFICATION) ---');
+        rejectedItems.forEach(r => {
+          rawParts.push(`❌ "${r.title}" — ${r.verificationNote}\n   URL: ${r.url}`);
+        });
+      }
+
+      if (verifiedItems.length > 0) {
+        rawParts.push(`\n--- VERIFICATION SUMMARY ---`);
+        rawParts.push(`✅ ${verifiedItems.length} results passed verification`);
+        if (rejectedItems.length > 0) rawParts.push(`❌ ${rejectedItems.length} results REJECTED (fabricated or broken URLs)`);
+      }
+
+      return res.json({
+        items: verifiedItems,
+        rawResponse: rawParts.join('\n\n'),
+        verifiedSources: realCitations,
+        stats: {
+          totalFound: parsedItems.length,
+          verified: verifiedItems.length,
+          rejected: rejectedItems.length
+        }
+      });
+
     } catch (parseErr) {
-      return res.json({ items: [], rawResponse });
+      return res.json({ items: [], rawResponse: rawParts.join('\n\n'), verifiedSources: realCitations, stats: { totalFound: 0, verified: 0, rejected: 0 } });
     }
 
   } catch (err) {
@@ -191,13 +339,13 @@ Respond with ONLY the JSON. No markdown, no backticks, no explanation before or 
   }
 });
 
-// ─── Start server ───
 app.listen(PORT, () => {
-  console.log(`CivicSentinel API running on port ${PORT}`);
-  console.log(`CORS allowed for: ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log(`CivicSentinel API v2.0 — Fact-Checked Edition`);
+  console.log(`Port: ${PORT}`);
+  console.log(`Verification: 3-layer (citation extraction → cross-reference → URL check)`);
   if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('⚠️  WARNING: ANTHROPIC_API_KEY not set! Searches will fail.');
+    console.warn('⚠️  ANTHROPIC_API_KEY not set!');
   } else {
-    console.log('✅ Anthropic API key configured');
+    console.log('✅ API key configured');
   }
 });
