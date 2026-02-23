@@ -20,7 +20,7 @@ app.use(cors({
   }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // ─── Rate limiter ───
 const rateLimits = new Map();
@@ -42,6 +42,151 @@ setInterval(() => {
   }
 }, 300000);
 
+// ═══════════════════════════════════════════
+// TDEC DATA STORE — in-memory, populated by scraper uploads
+// ═══════════════════════════════════════════
+const tdecStore = {
+  complaints: { records: [], lastUpdated: null, statewide: 0 },
+  permits: { records: [], lastUpdated: null, statewide: 0 },
+  inspections: { records: [], lastUpdated: null, statewide: 0 },
+  wells: { records: [], lastUpdated: null, statewide: 0 },
+  drillers: { records: [], lastUpdated: null, statewide: 0 }
+};
+
+// Upload key — simple auth so only your scraper can push data
+const UPLOAD_KEY = process.env.UPLOAD_KEY || 'civicsentinel2026';
+
+// Convert TDEC records to CivicSentinel feed items
+function tdecToFeedItems(records, sourceType) {
+  return records.map((r, i) => {
+    const text = JSON.stringify(r).toLowerCase();
+    let category = 'environment';
+    if (text.includes('geothermal')) category = 'geothermal';
+    else if (/sinkhole|karst|subsidence/.test(text)) category = 'karst_sinkholes';
+    else if (/well|groundwater|pump/.test(text)) category = 'water_wells';
+    else if (/erosion|sediment|stormwater|construction/.test(text)) category = 'construction';
+    else if (/sewage|overflow/.test(text)) category = 'environment';
+
+    let severity = 'medium';
+    if (/explosion|contamination|spill|illicit/.test(text)) severity = 'high';
+    if (r._priority === 'HIGH') severity = 'high';
+
+    const id = r.ID || r['Permit No'] || r['License No'] || `tdec_${i}`;
+    const site = r.Site || r['Site Name'] || r['Site ID'] || '';
+    const county = r.County || '';
+    const concerning = r.Concerning || r.Status || '';
+    const dateStr = r.Received || r.Inspected || r.Issuance || r['Date Completed'] || '';
+
+    return {
+      id: `tdec_${sourceType}_${id}`,
+      title: concerning ? `TDEC: ${concerning}` : `TDEC ${sourceType}: ${site || id}`,
+      summary: [
+        site ? `Site: ${site}` : '',
+        county ? `County: ${county}` : '',
+        r.Status ? `Status: ${r.Status}` : '',
+        r['Program Area'] ? `Program: ${r['Program Area']}` : '',
+        r['Permit No'] ? `Permit: ${r['Permit No']}` : '',
+      ].filter(Boolean).join('. ') + '.',
+      source: `TDEC ${sourceType}`,
+      url: 'https://dataviewers.tdec.tn.gov/dataviewers/',
+      timestamp: dateStr,
+      category,
+      severity,
+      location: county ? `${county} County, TN` : 'Tennessee',
+      verified: true,
+      verificationNote: 'Official TDEC public record — scraped from government database',
+      dataSource: 'tdec_scraper',
+      rawRecord: r
+    };
+  });
+}
+
+// ═══════════════════════════════════════════
+// TDEC ENDPOINTS
+// ═══════════════════════════════════════════
+
+// GET /api/tdec-feed — returns all TDEC data as feed items
+app.get('/api/tdec-feed', (req, res) => {
+  const county = req.query.county; // optional filter
+  const category = req.query.category; // optional filter
+  const allItems = [];
+
+  for (const [type, store] of Object.entries(tdecStore)) {
+    if (store.records.length > 0) {
+      allItems.push(...tdecToFeedItems(store.records, type));
+    }
+  }
+
+  let filtered = allItems;
+  if (county) {
+    filtered = filtered.filter(it => it.location.toLowerCase().includes(county.toLowerCase()));
+  }
+  if (category && category !== 'all') {
+    filtered = filtered.filter(it => it.category === category);
+  }
+
+  // Sort by date descending
+  filtered.sort((a, b) => {
+    const da = new Date(a.timestamp || 0);
+    const db = new Date(b.timestamp || 0);
+    return db - da;
+  });
+
+  res.json({
+    items: filtered,
+    total: filtered.length,
+    sources: Object.entries(tdecStore).reduce((acc, [k, v]) => {
+      acc[k] = { count: v.records.length, lastUpdated: v.lastUpdated, statewide: v.statewide };
+      return acc;
+    }, {}),
+    lastUpdated: Object.values(tdecStore).map(s => s.lastUpdated).filter(Boolean).sort().pop() || null
+  });
+});
+
+// GET /api/tdec-stats — quick summary
+app.get('/api/tdec-stats', (req, res) => {
+  const stats = {};
+  let total = 0;
+  for (const [type, store] of Object.entries(tdecStore)) {
+    stats[type] = { local: store.records.length, statewide: store.statewide, lastUpdated: store.lastUpdated };
+    total += store.records.length;
+  }
+  res.json({ totalLocalRecords: total, datasets: stats });
+});
+
+// POST /api/tdec-upload — scraper pushes data here
+app.post('/api/tdec-upload', (req, res) => {
+  const { key, type, records, statewide } = req.body;
+
+  if (key !== UPLOAD_KEY) {
+    return res.status(403).json({ error: 'Invalid upload key' });
+  }
+
+  const validTypes = ['complaints', 'permits', 'inspections', 'wells', 'drillers'];
+  if (!validTypes.includes(type)) {
+    return res.status(400).json({ error: `Invalid type. Use: ${validTypes.join(', ')}` });
+  }
+
+  if (!Array.isArray(records)) {
+    return res.status(400).json({ error: 'Records must be an array' });
+  }
+
+  tdecStore[type] = {
+    records: records,
+    lastUpdated: new Date().toISOString(),
+    statewide: statewide || records.length
+  };
+
+  console.log(`[TDEC Upload] ${type}: ${records.length} records (${statewide || '?'} statewide)`);
+
+  res.json({
+    success: true,
+    type,
+    stored: records.length,
+    statewide: statewide || records.length
+  });
+});
+
 // ─── URL verification ───
 async function verifyUrl(url) {
   try {
@@ -50,7 +195,7 @@ async function verifyUrl(url) {
     const r = await fetch(url, {
       method: 'HEAD',
       signal: controller.signal,
-      headers: { 'User-Agent': 'CivicSentinel/2.0 (community watchdog)' },
+      headers: { 'User-Agent': 'CivicSentinel/3.0 (community watchdog)' },
       redirect: 'follow'
     });
     clearTimeout(timeout);
@@ -62,7 +207,7 @@ async function verifyUrl(url) {
       const r2 = await fetch(url, {
         method: 'GET',
         signal: c2.signal,
-        headers: { 'User-Agent': 'CivicSentinel/2.0', 'Range': 'bytes=0-0' },
+        headers: { 'User-Agent': 'CivicSentinel/3.0', 'Range': 'bytes=0-0' },
         redirect: 'follow'
       });
       clearTimeout(t2);
@@ -76,9 +221,6 @@ function extractDomain(url) {
   catch { return 'Unknown'; }
 }
 
-// ─── Extract REAL citations from Claude's web search results ───
-// These are the actual URLs and snippets the search engine returned,
-// NOT Claude's reinterpretation. This is the source of truth.
 function extractCitations(content) {
   const citations = [];
   for (const block of content) {
@@ -101,12 +243,15 @@ function extractCitations(content) {
 
 // ─── Health check ───
 app.get('/', (req, res) => {
+  const tdecTotal = Object.values(tdecStore).reduce((s, v) => s + v.records.length, 0);
   res.json({
     service: 'CivicSentinel API',
     status: 'running',
-    version: '2.0.0',
+    version: '3.0.0',
     mission: 'Karst Basin Community Watchdog',
-    factChecking: 'enabled — all results verified against source URLs'
+    factChecking: 'enabled — all results verified against source URLs',
+    tdecRecords: tdecTotal,
+    tdecLastUpdated: Object.values(tdecStore).map(s => s.lastUpdated).filter(Boolean).sort().pop() || null
   });
 });
 
@@ -114,7 +259,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Main search endpoint ───
+// ─── Main search endpoint (unchanged — web search with fact checking) ───
 app.post('/api/search', async (req, res) => {
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   if (!checkRateLimit(clientIp)) {
@@ -188,8 +333,6 @@ Respond with ONLY JSON.`;
     const allContent = data.content || [];
     const textParts = allContent.filter(b => b.type === 'text').map(b => b.text);
     const searchParts = allContent.filter(b => b.type === 'web_search_tool_result');
-
-    // LAYER 1: Extract real citations from web search
     const realCitations = extractCitations(allContent);
 
     const rawParts = [];
@@ -204,7 +347,6 @@ Respond with ONLY JSON.`;
       });
     }
 
-    // LAYER 2: Parse Claude's structured response
     const fullText = textParts.join('\n');
     const cleaned = fullText.replace(/```json|```/g, '').trim();
 
@@ -214,7 +356,6 @@ Respond with ONLY JSON.`;
 
     const match = cleaned.match(/\[[\s\S]*\]/);
 
-    // If Claude didn't return structured items, build from raw citations
     if (!match) {
       if (realCitations.length > 0) {
         const items = realCitations.filter(c => c.url && c.title).map((c, i) => ({
@@ -235,15 +376,12 @@ Respond with ONLY JSON.`;
       return res.json({ items: [], rawResponse: rawParts.join('\n\n'), verifiedSources: realCitations, stats: { totalFound: 0, verified: 0, rejected: 0 } });
     }
 
-    // LAYER 3: Cross-reference and verify
     try {
       const parsedItems = JSON.parse(match[0]);
-
-      // Build lookup of real URLs
       const realUrlSet = new Set();
       for (const c of realCitations) {
         try { realUrlSet.add(new URL(c.url).hostname + new URL(c.url).pathname); } catch {}
-        realUrlSet.add(c.url); // also exact match
+        realUrlSet.add(c.url);
       }
       const realDomainSet = new Set(realCitations.map(c => c.source));
 
@@ -272,7 +410,6 @@ Respond with ONLY JSON.`;
           continue;
         }
 
-        // Check against real citations
         let urlKey = '';
         try { urlKey = new URL(item.url).hostname + new URL(item.url).pathname; } catch { urlKey = item.url; }
 
@@ -281,7 +418,6 @@ Respond with ONLY JSON.`;
           item.verificationNote = 'Confirmed — URL found in web search results';
           verifiedItems.push(item);
         } else if (realDomainSet.has(extractDomain(item.url))) {
-          // Domain matches — verify URL actually responds
           const exists = await verifyUrl(item.url);
           if (exists) {
             item.verified = true;
@@ -292,7 +428,6 @@ Respond with ONLY JSON.`;
             rejectedItems.push(item);
           }
         } else {
-          // Unknown domain — verify URL
           const exists = await verifyUrl(item.url);
           if (exists) {
             item.verified = true;
@@ -308,25 +443,15 @@ Respond with ONLY JSON.`;
       if (rejectedItems.length > 0) {
         rawParts.push('\n--- REJECTED (FAILED VERIFICATION) ---');
         rejectedItems.forEach(r => {
-          rawParts.push(`❌ "${r.title}" — ${r.verificationNote}\n   URL: ${r.url}`);
+          rawParts.push(`"${r.title}" — ${r.verificationNote}\n   URL: ${r.url}`);
         });
-      }
-
-      if (verifiedItems.length > 0) {
-        rawParts.push(`\n--- VERIFICATION SUMMARY ---`);
-        rawParts.push(`✅ ${verifiedItems.length} results passed verification`);
-        if (rejectedItems.length > 0) rawParts.push(`❌ ${rejectedItems.length} results REJECTED (fabricated or broken URLs)`);
       }
 
       return res.json({
         items: verifiedItems,
         rawResponse: rawParts.join('\n\n'),
         verifiedSources: realCitations,
-        stats: {
-          totalFound: parsedItems.length,
-          verified: verifiedItems.length,
-          rejected: rejectedItems.length
-        }
+        stats: { totalFound: parsedItems.length, verified: verifiedItems.length, rejected: rejectedItems.length }
       });
 
     } catch (parseErr) {
@@ -340,12 +465,12 @@ Respond with ONLY JSON.`;
 });
 
 app.listen(PORT, () => {
-  console.log(`CivicSentinel API v2.0 — Fact-Checked Edition`);
+  console.log(`CivicSentinel API v3.0 — TDEC Data + Fact-Checked Search`);
   console.log(`Port: ${PORT}`);
-  console.log(`Verification: 3-layer (citation extraction → cross-reference → URL check)`);
+  console.log(`TDEC endpoints: GET /api/tdec-feed, GET /api/tdec-stats, POST /api/tdec-upload`);
   if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('⚠️  ANTHROPIC_API_KEY not set!');
+    console.warn('WARNING: ANTHROPIC_API_KEY not set!');
   } else {
-    console.log('✅ API key configured');
+    console.log('API key configured');
   }
 });
